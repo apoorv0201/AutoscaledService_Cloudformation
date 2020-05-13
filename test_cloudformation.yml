@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploying an Autoscaled Service
+Parameters:
+   keyName:
+     Type: 'AWS::EC2::KeyPair::KeyName'
+     Default: <use your keyname here>
+   instanceType:
+     Description: InstanceType
+     Type: String
+     Default: t2.micro
+   amiId:
+     Type: String
+     Default: <Amazon linux ami>
+   ec2RootVolumeSize:
+     Description: RootVolumeSize minimum value is 30 GB
+     Type: Number
+     MinValue: 30
+     Default: 30
+   VpcCIDR:
+     Description: Please enter the IP range (CIDR notation) for this VPC
+     Type: String
+     Default: 10.1.0.0/16
+   PublicSubnet1CIDR:
+     Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+     Type: String
+     Default: 10.1.10.0/24
+   PublicSubnet2CIDR:
+     Description: Please enter the IP range (CIDR notation) for the public subnet in the second Availability Zone
+     Type: String
+     Default: 10.1.20.0/24
+Resources:
+     VPC:
+       Type: AWS::EC2::VPC
+       Properties:
+         CidrBlock: !Ref VpcCIDR
+         EnableDnsSupport: true
+         EnableDnsHostnames: true
+         InstanceTenancy: "default"
+     InternetGateway:
+       Type: AWS::EC2::InternetGateway
+       DependsOn: VPC
+     AttachGateway:
+       Type: AWS::EC2::VPCGatewayAttachment
+       Properties:
+         VpcId: !Ref VPC
+         InternetGatewayId: !Ref InternetGateway
+     PublicSubnet1Id:
+         Type: 'AWS::EC2::Subnet'
+         Properties:
+           AvailabilityZone: !Select [ 0, !GetAZs ]
+           CidrBlock: !Ref PublicSubnet1CIDR
+           VpcId: !Ref VPC
+     PublicSubnet2Id:
+         Type: 'AWS::EC2::Subnet'
+         Properties:
+           AvailabilityZone: !Select [ 1, !GetAZs ]
+           CidrBlock: !Ref PublicSubnet2CIDR
+           VpcId: !Ref VPC
+     PublicRouteTable:
+         Type: AWS::EC2::RouteTable
+         Properties:
+           VpcId: !Ref VPC
+           Tags:
+           - Key: Name
+             Value: Public
+     PublicRoute1:
+         Type: AWS::EC2::Route
+         DependsOn: AttachGateway
+         Properties:
+           RouteTableId: !Ref PublicRouteTable
+           DestinationCidrBlock: 0.0.0.0/0
+           GatewayId: !Ref InternetGateway
+     PublicSubnet1RouteTableAssociation:
+         Type: AWS::EC2::SubnetRouteTableAssociation
+         Properties:
+           SubnetId: !Ref PublicSubnet1Id
+           RouteTableId: !Ref PublicRouteTable
+     PublicSubnet2RouteTableAssociation:
+         Type: AWS::EC2::SubnetRouteTableAssociation
+         Properties:
+           SubnetId: !Ref PublicSubnet2Id
+           RouteTableId: !Ref PublicRouteTable
+     SecurityGroup:
+         Type: 'AWS::EC2::SecurityGroup'
+         Properties:
+             GroupDescription: test Security Group
+             GroupName: Allow web
+             VpcId: !Ref VPC
+             Tags:
+                 - Key: Name
+                   Value: testSG
+     SecurityGroupForIncoming:
+         Type: 'AWS::EC2::SecurityGroupIngress'
+         Properties:
+             GroupId: !Ref SecurityGroup
+             IpProtocol: tcp
+             FromPort: 80
+             ToPort: 80
+             CidrIp: 0.0.0.0/0
+     SecurityGroupForIncomingSG:
+         Type: 'AWS::EC2::SecurityGroupIngress'
+         Properties:
+             GroupId: !Ref SecurityGroup
+             IpProtocol: tcp
+             FromPort: 80
+             ToPort: 80
+             SourceSecurityGroupId: !Ref ALBSecurityGroup
+     DeployAppLaunchConfig:
+         Type: AWS::AutoScaling::LaunchConfiguration
+         Properties:
+           LaunchConfigurationName: my-test-lc
+           AssociatePublicIpAddress: true
+           ImageId: !Ref amiId
+           InstanceType: !Ref instanceType
+           KeyName: !Ref keyName
+           PlacementTenancy: default
+           SecurityGroups:
+             - !Ref SecurityGroup
+           #UserData:
+            # Fn::Base64:
+            #   Fn::Sub:
+           UserData: !Base64
+              'Fn::Sub': >
+                #!/bin/bash
+  
+                set -e
+                
+                sudo yum -y update
+                
+                sudo yum install -y nginx
+
+                sudo rm /usr/share/nginx/html/index.html
+
+                sudo tee /usr/share/nginx/html/index.html << EOF
+
+                <h1>I love Rooster Teeth</h1>
+                
+                EOF
+
+                sudo service nginx start
+                
+                sudo service nginx enable
+
+     DeployAppASG:
+         Type: AWS::AutoScaling::AutoScalingGroup
+         Properties:
+           AutoScalingGroupName: my-test-asg
+ #          AvailabilityZones:
+ #          - !Select [ 0, !GetAZs ]
+ #            - !Select [ 1, !GetAZs ]
+           VPCZoneIdentifier:
+             - !Ref PublicSubnet1Id
+             - !Ref PublicSubnet2Id
+           DesiredCapacity: '2'
+           LaunchConfigurationName: !Ref DeployAppLaunchConfig
+           MaxSize: '2'
+           MinSize: '2'
+           TargetGroupARNs:
+             - !Ref WebAppTargetGroup
+           Tags:
+               - Key: Name
+                 Value: testASG
+                 PropagateAtLaunch: True
+         UpdatePolicy:
+           AutoScalingReplacingUpdate:
+             WillReplace: True
+     AppScaleUpPolicy:
+         Type: AWS::AutoScaling::ScalingPolicy
+         Properties:
+           AdjustmentType: ChangeInCapacity
+           AutoScalingGroupName: !Ref DeployAppASG
+           Cooldown: '60'
+           ScalingAdjustment: 1
+     AppScaleDownPolicy:
+         Type: AWS::AutoScaling::ScalingPolicy
+         Properties:
+           AdjustmentType: ChangeInCapacity
+           AutoScalingGroupName: !Ref DeployAppASG
+           Cooldown: '300'
+           ScalingAdjustment: -1
+     CPUAlarmHigh:
+         Type: AWS::CloudWatch::Alarm
+         Properties:
+           AlarmDescription: Scale-up if CPU > 80% for 5 minutes
+           MetricName: CPUUtilization
+           Namespace: AWS/EC2
+           Statistic: Average
+           Period: 300
+           EvaluationPeriods: 2
+           Threshold: 80
+           AlarmActions: [!Ref AppScaleUpPolicy]
+           Dimensions:
+           - Name: AutoScalingGroupName
+             Value: !Ref DeployAppASG
+           ComparisonOperator: GreaterThanThreshold 
+     CPUAlarmLow:
+         Type: AWS::CloudWatch::Alarm
+         Properties:
+           AlarmDescription: Scale-down if CPU < 20% for 5 minutes
+           MetricName: CPUUtilization
+           Namespace: AWS/EC2
+           Statistic: Average
+           Period: 300
+           EvaluationPeriods: 2
+           Threshold: 20
+           AlarmActions: [!Ref AppScaleDownPolicy]
+           Dimensions:
+           - Name: AutoScalingGroupName
+             Value: !Ref DeployAppASG
+           ComparisonOperator: LessThanThreshold
+     ALBSecurityGroup:
+         Type: 'AWS::EC2::SecurityGroup'
+         Properties:
+           VpcId: !Ref VPC
+           GroupDescription: Enable HTTP access
+           SecurityGroupIngress:
+             - IpProtocol: 'tcp'
+               FromPort: 80
+               ToPort: 80
+               CidrIp: 0.0.0.0/0
+           Tags:
+             - Key: Name
+               Value: testALBSG 
+     WebAppALB:
+         Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+         Properties:
+           IpAddressType: ipv4
+           Scheme: internet-facing
+           # DependsOn: InternetGateway
+           SecurityGroups:
+             - !Ref ALBSecurityGroup
+           Subnets:
+             - !Ref PublicSubnet1Id
+             - !Ref PublicSubnet2Id
+           Tags:
+             - Key: Name
+               Value: testALB
+           Type: application
+     Listener:
+         Type: AWS::ElasticLoadBalancingV2::Listener
+         Properties:
+           DefaultActions:
+             - Type: forward
+               TargetGroupArn:
+                 Ref: WebAppTargetGroup
+           LoadBalancerArn:
+             Ref: WebAppALB
+           Port: 80
+           Protocol: HTTP
+     WebAppTargetGroup:
+         Type: AWS::ElasticLoadBalancingV2::TargetGroup
+         Properties:
+           Port: 80
+           Protocol: 'HTTP'
+           VpcId: !Ref VPC
+           HealthCheckIntervalSeconds: 30
+           HealthCheckPath: /
+           HealthCheckPort: '80'
+           HealthCheckProtocol: HTTP
+           HealthCheckTimeoutSeconds: 5
+           HealthyThresholdCount: 2
+           Tags:
+             - Key: Name
+               Value: testWebAppTG
+ 
+ 
+Outputs:
+   testALBDNS:
+     Description: Web App ALB DNS Name
+     Value:
+       Fn::Join:
+         - ''
+         - - "http://"
+           - Fn::GetAtt: WebAppALB.DNSName
